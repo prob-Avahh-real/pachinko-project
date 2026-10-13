@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">弹珠</string>
+    <string name="title_activity_main">弹珠</string>
+    <string name="package_name">com.skat.pachinko</string>
+    <string name="custom_url_scheme">com.skat.pachinko</string>
+</resources>

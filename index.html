@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>パチンコ — Pachinko Classic</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #08081a;
+  display: flex; justify-content: center; align-items: center;
+  height: 100vh; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+#gameCanvas {
+  touch-action: none;
+}
+#ui-overlay {
+  position: absolute; top: 0; left: 0; right: 0;
+  pointer-events: none;
+  display: flex; justify-content: space-between;
+  padding: 12px 16px;
+}
+#score-display {
+  color: #ffd700;
+  font-size: 20px; font-weight: bold;
+  text-shadow: 0 0 10px rgba(255,215,0,0.5);
+}
+#balls-display {
+  color: #94a3b8;
+  font-size: 14px; font-weight: 500;
+}
+#game-over {
+  display: none;
+  position: absolute; inset: 0;
+  justify-content: center; align-items: center;
+  background: rgba(0,0,0,0.7);
+}
+#game-over.show { display: flex; }
+#game-over-card {
+  background: #1a1a2e; border: 1px solid #b8860b;
+  border-radius: 16px; padding: 32px; text-align: center;
+}
+#game-over h2 { color: #ffd700; font-size: 28px; margin-bottom: 8px; }
+#game-over p { color: #94a3b8; margin-bottom: 20px; }
+#game-over button {
+  background: #ffd700; color: #1a1a2e;
+  border: none; padding: 12px 32px; border-radius: 8px;
+  font-size: 16px; font-weight: 600; cursor: pointer;
+  pointer-events: all;
+}
+#game-over button:active { opacity: 0.8; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="ui-overlay">
+  <div>
+    <div id="score-display">0</div>
+    <div id="balls-display">球: 15</div>
+  </div>
+  <div id="fever-display" style="color:#ff2d95;font-weight:bold;display:none;">🔥 FEVER ×5</div>
+</div>
+<div id="game-over">
+  <div id="game-over-card">
+    <h2>🎯 GAME OVER</h2>
+    <p>最终得分 <span id="final-score" style="color:#ffd700;font-size:24px;font-weight:bold;">0</span></p>
+    <button onclick="game.restart()">再来一局</button>
+  </div>
+</div>
+<script>
+// ===== Pachinko — HTML5 Canvas port =====
+
+const CONFIG = {
+  pinCols: 9, pinRows: 16,
+  pinRadius: 5, ballRadius: 7,
+  gravity: 900, pinBounce: 0.55, friction: 0.998, maxSpeed: 800,
+  initialBalls: 15, powerOscSpeed: 2.8,
+  feverThreshold: 5, feverDuration: 8000, maxActiveBalls: 5,
+  pocketPositions: [0.02, 0.14, 0.27, 0.40, 0.50, 0.60, 0.73, 0.86, 0.98],
+  pocketLabels: ['OUT','×1','×3','×5','FEVER','×5','×3','×1','OUT'],
+  pocketValues: [0, 100, 300, 500, -1, 500, 300, 100, 0],
+  pocketColors: ['#330000','#ff6600','#ff9900','#ffcc00','#ff2d95','#ffcc00','#ff9900','#ff6600','#330000'],
+};
+
+class PachinkoGame {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+
+    // Board geometry
+    this.boardLeft = 0; this.boardTop = 0; this.boardW = 0; this.boardH = 0;
+    this.pinStartY = 0; this.pinEndY = 0; this.pocketY = 0;
+
+    // Game state
+    this.pins = []; this.pockets = []; this.balls = []; this.particles = [];
+    this.score = 0; this.multiplier = 1;
+    this.ballsRemaining = CONFIG.initialBalls;
+    this.feverCount = 0; this.isFever = false; this.feverTimer = 0;
+    this.powerLevel = 0.5; this.powerDir = 1;
+    this.screenShake = 0; this.comboCount = 0; this.lastPocketTime = 0;
+    this.gameOver = false; this.launched = false;
+    this.lastTime = 0;
+
+    // Touch handling
+    this.setupInput();
+    this.setupBoard();
+    this.restart();
+    this.loop(0);
+  }
+
+  resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = window.innerWidth; const h = window.innerHeight;
+    this.canvas.width = w * dpr;
+    this.canvas.height = h * dpr;
+    this.canvas.style.width = w + 'px';
+    this.canvas.style.height = h + 'px';
+    this.ctx.scale(dpr, dpr);
+    this.W = w; this.H = h;
+    this.setupBoard();
+  }
+
+  setupBoard() {
+    const w = this.W, h = this.H;
+    const padX = 16, padTop = 50, padBottom = 130;
+    this.boardLeft = padX;
+    this.boardTop = padTop;
+    this.boardW = w * 0.88 - padX;
+    this.boardH = h - padTop - padBottom;
+    this.pinStartY = padTop + 45;
+    this.pinEndY = padTop + this.boardH - 85;
+    this.pocketY = this.pinEndY + 35;
+
+    // Build pins
+    this.pins = [];
+    const psX = this.boardW / (CONFIG.pinCols + 1);
+    const psY = (this.pinEndY - this.pinStartY) / CONFIG.pinRows;
+    for (let row = 0; row < CONFIG.pinRows; row++) {
+      const offX = (row % 2) * psX * 0.5;
+      for (let col = 0; col < CONFIG.pinCols; col++) {
+        this.pins.push({
+          x: this.boardLeft + psX + col * psX + offX,
+          y: this.pinStartY + row * psY,
+          r: CONFIG.pinRadius,
+        });
+      }
+    }
+
+    // Build pockets
+    this.pockets = [];
+    const pkCount = CONFIG.pocketPositions.length;
+    const pkW = this.boardW / (pkCount + 1);
+    for (let i = 0; i < pkCount; i++) {
+      const cx = this.boardLeft + (i + 1) * pkW;
+      const halfW = pkW * 0.88 * 0.5;
+      this.pockets.push({
+        x: cx - halfW, y: this.pocketY, w: halfW * 2, h: 38,
+        label: CONFIG.pocketLabels[i],
+        value: CONFIG.pocketValues[i],
+        color: CONFIG.pocketColors[i],
+        isFever: i === Math.floor(pkCount / 2),
+      });
+    }
+  }
+
+  setupInput() {
+    const handleTap = (x, y) => {
+      // Check tap on launch area (bottom center)
+      this.launchBall(this.powerLevel);
+    };
+
+    this.canvas.addEventListener('click', (e) => {
+      const rect = this.canvas.getBoundingClientRect();
+      handleTap(e.clientX - rect.left, e.clientY - rect.top);
+    });
+
+    this.canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const rect = this.canvas.getBoundingClientRect();
+      const touch = e.touches[0];
+      handleTap(touch.clientX - rect.left, touch.clientY - rect.top);
+    }, { passive: false });
+  }
+
+  // ── Game logic ──
+
+  restart() {
+    this.score = 0; this.multiplier = 1;
+    this.ballsRemaining = CONFIG.initialBalls;
+    this.feverCount = 0; this.isFever = false; this.feverTimer = 0;
+    this.balls = []; this.particles = [];
+    this.comboCount = 0; this.lastPocketTime = 0;
+    this.screenShake = 0; this.powerLevel = 0.5; this.powerDir = 1;
+    this.gameOver = false; this.launched = false;
+    document.getElementById('game-over').classList.remove('show');
+    document.getElementById('fever-display').style.display = 'none';
+    this.updateUI();
+  }
+
+  launchBall(power) {
+    if (this.gameOver) return;
+    if (this.ballsRemaining <= 0 || this.balls.length >= CONFIG.maxActiveBalls) return;
+
+    const cx = this.boardLeft + this.boardW / 2;
+    const lx = cx + (Math.random() - 0.5) * 70 * power;
+    const ly = this.pinStartY - 35;
+
+    this.balls.push({
+      x: lx, y: ly, vx: (Math.random() - 0.5) * 100, vy: -280 - power * 650,
+      r: CONFIG.ballRadius, active: true, hitCount: 0,
+    });
+    this.ballsRemaining--;
+    this.updateUI();
+  }
+
+  spawnParticles(x, y, count, color) {
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 50 + Math.random() * 220;
+      this.particles.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 60,
+        life: 0.35 + Math.random() * 0.55,
+        maxLife: 0.35 + Math.random() * 0.55,
+        color, size: 1.5 + Math.random() * 3.5,
+      });
+    }
+  }
+
+  tick(dt) {
+    // Power meter
+    this.powerLevel += this.powerDir * CONFIG.powerOscSpeed * dt;
+    if (this.powerLevel >= 1) { this.powerLevel = 1; this.powerDir = -1; }
+    else if (this.powerLevel <= 0.1) { this.powerLevel = 0.1; this.powerDir = 1; }
+
+    // Fever timer
+    if (this.isFever) {
+      this.feverTimer -= dt * 1000;
+      if (this.feverTimer <= 0) {
+        this.isFever = false;
+        this.multiplier = 1;
+        this.screenShake = 0;
+        document.getElementById('fever-display').style.display = 'none';
+      }
+    }
+
+    // Screen shake decay
+    if (this.screenShake > 0) {
+      this.screenShake *= 0.91;
+      if (this.screenShake < 0.001) this.screenShake = 0;
+    }
+
+    // Update particles
+    this.updateParticles(dt);
+
+    // Update balls
+    const br = this.boardLeft + this.boardW;
+    for (let i = this.balls.length - 1; i >= 0; i--) {
+      const b = this.balls[i];
+      if (!b.active) continue;
+
+      // Gravity & friction
+      b.vy += CONFIG.gravity * dt;
+      b.vx *= CONFIG.friction;
+      b.vy *= CONFIG.friction;
+
+      // Speed clamp
+      const spd = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+      if (spd > CONFIG.maxSpeed) {
+        const s = CONFIG.maxSpeed / spd;
+        b.vx *= s; b.vy *= s;
+      }
+
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+
+      // Wall bounce
+      if (b.x - b.r < this.boardLeft) {
+        b.x = this.boardLeft + b.r; b.vx *= -0.6;
+      }
+      if (b.x + b.r > br) {
+        b.x = br - b.r; b.vx *= -0.6;
+      }
+
+      // Pin collision
+      for (const pin of this.pins) {
+        const dx = b.x - pin.x;
+        const dy = b.y - pin.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const md = b.r + pin.r;
+        if (dist < md && dist > 0) {
+          const overlap = md - dist;
+          const nx = dx / dist, ny = dy / dist;
+          b.x += nx * overlap;
+          b.y += ny * overlap;
+          const vn = b.vx * nx + b.vy * ny;
+          if (vn < 0) {
+            b.vx -= (1 + CONFIG.pinBounce) * vn * nx;
+            b.vy -= (1 + CONFIG.pinBounce) * vn * ny;
+          }
+          b.vx += (Math.random() - 0.5) * 35;
+          b.vy += (Math.random() - 0.5) * 35;
+          b.hitCount++;
+          if (b.hitCount % 3 === 0) {
+            this.spawnParticles(b.x, b.y, 2, '#ffd700');
+          }
+        }
+      }
+
+      // Pocket detection
+      if (b.y + b.r >= this.pocketY && b.y < this.pocketY + 55) {
+        for (const pk of this.pockets) {
+          if (b.x > pk.x && b.x < pk.x + pk.w && b.y + b.r >= pk.y) {
+            this.resolvePocket(b, pk);
+            this.balls.splice(i, 1);
+            break;
+          }
+        }
+        continue;
+      }
+
+      // Drain
+      if (b.y > this.pocketY + 80) {
+        this.comboCount = 0;
+        this.spawnParticles(b.x, b.y + 10, 5, '#660000');
+        this.balls.splice(i, 1);
+      }
+    }
+
+    // Game over check
+    if (this.ballsRemaining <= 0 && this.balls.length === 0 && !this.isFever && !this.gameOver) {
+      this.gameOver = true;
+      document.getElementById('final-score').textContent = this.score;
+      document.getElementById('game-over').classList.add('show');
+    }
+  }
+
+  resolvePocket(b, pk) {
+    if (pk.isFever) {
+      this.feverCount++;
+      this.spawnParticles(b.x, b.y, 22, '#ff2d95');
+      if (this.feverCount >= CONFIG.feverThreshold && !this.isFever) {
+        this.isFever = true;
+        this.feverTimer = CONFIG.feverDuration;
+        this.multiplier = 5;
+        this.ballsRemaining += 10;
+        this.feverCount = 0;
+        this.screenShake = 0.6;
+        this.spawnParticles(this.boardLeft + this.boardW / 2, this.boardTop + 100, 40, '#ff2d95');
+        document.getElementById('fever-display').style.display = 'block';
+        return;
+      }
+      if (this.isFever) {
+        this.score += 1000 * this.multiplier;
+        this.spawnParticles(b.x, b.y, 20, '#ffd700');
+        this.updateUI();
+        return;
+      }
+      return;
+    }
+
+    if (pk.value > 0) {
+      const now = performance.now();
+      if (now - this.lastPocketTime < 1500) {
+        this.comboCount++;
+      } else {
+        this.comboCount = 0;
+      }
+      this.lastPocketTime = now;
+
+      const comboBonus = Math.min(this.comboCount, 5) * 0.2;
+      const pts = Math.round(pk.value * this.multiplier * (1 + comboBonus));
+      this.score += pts;
+      this.spawnParticles(b.x, b.y, pk.value >= 500 ? 15 : 8, pk.color);
+      this.updateUI();
+    } else {
+      this.comboCount = 0;
+      this.spawnParticles(b.x, b.y + 10, 5, '#660000');
+    }
+  }
+
+  updateParticles(dt) {
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.life -= dt;
+      if (p.life <= 0) { this.particles.splice(i, 1); continue; }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 280 * dt;
+      p.size *= 0.995;
+    }
+  }
+
+  updateUI() {
+    document.getElementById('score-display').textContent = this.score;
+    document.getElementById('balls-display').textContent = `球: ${this.ballsRemaining}`;
+  }
+
+  // ── Rendering ──
+
+  draw() {
+    const ctx = this.ctx;
+    const W = this.W, H = this.H;
+
+    // Screen shake offset
+    let shakeX = 0, shakeY = 0;
+    if (this.screenShake > 0) {
+      shakeX = (Math.random() - 0.5) * this.screenShake * 20;
+      shakeY = (Math.random() - 0.5) * this.screenShake * 20;
+      ctx.save();
+      ctx.translate(shakeX, shakeY);
+    }
+
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#08081a');
+    grad.addColorStop(0.5, '#0c0c22');
+    grad.addColorStop(1, '#040410');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Subtle grid
+    ctx.strokeStyle = 'rgba(255,215,0,0.03)';
+    ctx.lineWidth = 0.5;
+    for (let x = 0; x < W; x += 28) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+    for (let y = 0; y < H; y += 28) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+    // Board frame
+    const frameColor = this.isFever ? '#ff2d95' : '#b8860b';
+    ctx.shadowColor = frameColor;
+    ctx.shadowBlur = this.isFever ? 10 : 5;
+    ctx.strokeStyle = frameColor;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(
+      this.boardLeft - 8, this.boardTop - 8,
+      this.boardW + 16, this.pocketY + 50 - this.boardTop + 16
+    );
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(184,134,11,0.3)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(
+      this.boardLeft - 4, this.boardTop - 4,
+      this.boardW + 8, this.pocketY + 46 - this.boardTop
+    );
+
+    // Pins
+    for (const pin of this.pins) {
+      // Glow
+      const rg = ctx.createRadialGradient(pin.x, pin.y, 0, pin.x, pin.y, pin.r * 3.2);
+      rg.addColorStop(0, 'rgba(255,215,0,0.4)');
+      rg.addColorStop(0.5, 'rgba(255,215,0,0.1)');
+      rg.addColorStop(1, 'rgba(255,215,0,0)');
+      ctx.fillStyle = rg;
+      ctx.beginPath();
+      ctx.arc(pin.x, pin.y, pin.r * 3.2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Body
+      const rg2 = ctx.createRadialGradient(pin.x - 1, pin.y - 1, 0, pin.x, pin.y, pin.r);
+      rg2.addColorStop(0, '#fff');
+      rg2.addColorStop(0.5, '#ffd700');
+      rg2.addColorStop(1, '#b8860b');
+      ctx.fillStyle = rg2;
+      ctx.beginPath();
+      ctx.arc(pin.x, pin.y, pin.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Pockets
+    for (const pk of this.pockets) {
+      // Glow
+      const glowAlpha = pk.isFever
+        ? (this.isFever ? 0.7 : 0.35 + Math.sin(performance.now() * 0.005) * 0.2)
+        : 0.2;
+      ctx.fillStyle = hexToRgba(pk.color, glowAlpha);
+      ctx.fillRect(pk.x - 3, pk.y - 3, pk.w + 6, pk.h + 6);
+
+      // Body gradient
+      const lg = ctx.createLinearGradient(0, pk.y, 0, pk.y + pk.h);
+      lg.addColorStop(0, 'rgba(0,0,0,0.85)');
+      lg.addColorStop(0.5, pk.color);
+      lg.addColorStop(1, 'rgba(0,0,0,0.92)');
+      ctx.fillStyle = lg;
+      ctx.fillRect(pk.x, pk.y, pk.w, pk.h);
+
+      // Border
+      ctx.strokeStyle = pk.color;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(pk.x, pk.y, pk.w, pk.h);
+
+      // Label
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(pk.label, pk.x + pk.w / 2, pk.y + pk.h / 2);
+    }
+
+    // Balls
+    for (const b of this.balls) {
+      if (!b.active) continue;
+
+      // Trail glow
+      ctx.fillStyle = 'rgba(255,215,0,0.12)';
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r * 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Ball body
+      const rg3 = ctx.createRadialGradient(b.x - 2, b.y - 2, 0, b.x, b.y, b.r);
+      rg3.addColorStop(0, '#fff');
+      rg3.addColorStop(0.4, '#e8e8e8');
+      rg3.addColorStop(0.7, '#c0c0c0');
+      rg3.addColorStop(1, '#808080');
+      ctx.fillStyle = rg3;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Glow ring
+      const ringColor = this.isFever ? '#ff2d95' : '#ffd700';
+      ctx.shadowColor = ringColor;
+      ctx.shadowBlur = this.isFever ? 5 : 3;
+      ctx.strokeStyle = ringColor;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r + 1, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    // Particles
+    for (const p of this.particles) {
+      const alpha = p.life / p.maxLife;
+      ctx.fillStyle = hexToRgba(p.color, alpha);
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 2;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // Power meter
+    const mx = 12; const my = this.H - 105;
+    const mw = 14; const mh = 80;
+    const px = this.W - mx - mw;
+    const py = my;
+
+    // Background
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(px - 2, py - 2, mw + 4, mh + 4);
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px - 2, py - 2, mw + 4, mh + 4);
+
+    // Fill
+    const fillH = mh * this.powerLevel;
+    const fillY = py + mh - fillH;
+    let meterColor;
+    if (this.powerLevel > 0.85) meterColor = '#ff2d95';
+    else if (this.powerLevel > 0.6) meterColor = '#ff6600';
+    else if (this.powerLevel > 0.3) meterColor = '#ffd700';
+    else meterColor = '#39ff14';
+
+    const mGrad = ctx.createLinearGradient(0, fillY + fillH, 0, fillY);
+    mGrad.addColorStop(0, meterColor);
+    mGrad.addColorStop(1, '#fff');
+    ctx.fillStyle = mGrad;
+    ctx.fillRect(px, fillY, mw, fillH);
+
+    // Glow border
+    ctx.shadowColor = meterColor;
+    ctx.shadowBlur = 5;
+    ctx.strokeStyle = meterColor;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(px, fillY, mw, fillH);
+    ctx.shadowBlur = 0;
+
+    // Label
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 8px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('PWR', px + mw / 2, py - 2);
+
+    // Launch hint
+    ctx.fillStyle = 'rgba(255,215,0,0.5)';
+    ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('点击发射', this.boardLeft + this.boardW / 2, this.H - 18);
+
+    // Fever overlay
+    if (this.isFever) {
+      const pulse = 0.5 + Math.sin(performance.now() * 0.008) * 0.3;
+      ctx.fillStyle = `rgba(255,45,149,${pulse * 0.12})`;
+      ctx.fillRect(this.boardLeft, this.boardTop, this.boardW, this.pocketY + 50 - this.boardTop);
+    }
+
+    if (this.screenShake > 0) {
+      ctx.restore();
+    }
+  }
+
+  // ── Game loop ──
+
+  loop(time) {
+    const dt = this.lastTime ? Math.min((time - this.lastTime) / 1000, 0.033) : 0.016;
+    this.lastTime = time;
+
+    this.tick(dt);
+    this.draw();
+
+    requestAnimationFrame((t) => this.loop(t));
+  }
+}
+
+// ── Helpers ──
+
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// ── Start ──
+
+const canvas = document.getElementById('gameCanvas');
+const game = new PachinkoGame(canvas);
+</script>
+</body>
+</html>
